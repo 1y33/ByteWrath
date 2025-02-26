@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from ops import FastRMSNorm
 # llama 2
 
 @dataclass
@@ -20,18 +20,25 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
     device: str = None
+    
+    use_triton: bool = True
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_triton: bool = True):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x: torch.Tensor):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        self.use_triton = use_triton
 
     def forward(self, x: torch.Tensor):
-        return self.weight * self._norm(x.float()).type_as(x)
+        if self.use_triton:
+            return FastRMSNorm.apply(x, self.weight, self.eps)
+        else:
+            x_float = x.float()
+
+            norm = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+
+            return self.weight * norm.type_as(x)
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     assert head_dim % 2 == 0, "Dimension must be divisible by 2"
@@ -136,6 +143,7 @@ class EncoderBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
+        
         self.attention = SelfAttention(args)
         self.feed_forward = FeedForward(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
