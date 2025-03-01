@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from sentencepiece import SentencePieceProcessor
 from tqdm import tqdm
-from models import llama
+from models import model
 
 
 class LLaMA:
@@ -26,7 +26,7 @@ class LLaMA:
         
         # Load model parameters
         params = json.loads(Path(checkpoints_dir, "params.json").read_text())
-        model_args = llama.ModelArgs(max_seq_len=max_seq_len, max_batch_size=max_batch_size, device=device, **params)
+        model_args = model.ModelArgs(max_seq_len=max_seq_len, max_batch_size=max_batch_size, device=device, **params)
 
         # Setup tokenizer
         tokenizer = SentencePieceProcessor()
@@ -40,7 +40,7 @@ class LLaMA:
             torch.set_default_tensor_type(torch.BFloat16Tensor)
 
         # Build the model and load weights if needed
-        model = llama.Transformer(model_args).to(device)
+        model = model.Transformer(model_args).to(device)
         if load_model:
             checkpoint.pop('rope.freqs', None)
             model.load_state_dict(checkpoint, strict=True)
