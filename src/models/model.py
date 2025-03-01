@@ -28,6 +28,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        
         self.use_triton = use_triton
 
     def forward(self, x: torch.Tensor):
