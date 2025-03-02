@@ -98,12 +98,13 @@ class FFN(nn.Module):
         return final_output.view(batch_size, seq_len, dim)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, head_dim: int, max_seq_len: int):
+    def __init__(self, dim: int, n_heads: int, head_dim: int, max_seq_len: int, use_triton: bool = False):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
+        self.use_triton = use_triton
         
         # Projection matrices
         self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -126,7 +127,8 @@ class MultiHeadAttention(nn.Module):
         
         q = (q * torch.cos(emb)) + (self.rotate_half(q) * torch.sin(emb))
         k = (k * torch.cos(emb)) + (self.rotate_half(k) * torch.sin(emb))
-        return q, k  # Fix the missing 'k' here
+        return q, k
+        
     def rotate_half(self, x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
@@ -148,32 +150,50 @@ class MultiHeadAttention(nn.Module):
             v = torch.cat([self.cache['v'], v], dim=2)
         self.cache = {'k': k, 'v': v}
         
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        # Apply mask if provided
-        if mask is not None:
-            scores = scores + mask
-        
-        # Apply softmax and compute weighted sum
-        attn_weights = F.softmax(scores, dim=-1)
-        context = torch.matmul(attn_weights, v)
-        
-        # Reshape and project to output dimension
-        context = context.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        output = self.wo(context)
-        
-        return output
+        # Use triton flash attention if enabled and CUDA is available
+        if self.use_triton and torch.cuda.is_available():
+            from src.ops.flash_attention import TritonAttention
+            
+            # Determine if this is causal attention (has mask)
+            causal = mask is not None
+            softmax_scale = 1.0 / math.sqrt(self.head_dim)
+            
+            # Use the triton implementation
+            context = TritonAttention.apply(q, k, v, causal, softmax_scale)
+            
+            # Reshape and project to output dimension
+            context = context.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+            output = self.wo(context)
+            
+            return output
+        else:
+            # Standard attention implementation
+            # Compute attention scores
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            
+            # Apply mask if provided
+            if mask is not None:
+                scores = scores + mask
+            
+            # Apply softmax and compute weighted sum
+            attn_weights = F.softmax(scores, dim=-1)
+            context = torch.matmul(attn_weights, v)
+            
+            # Reshape and project to output dimension
+            context = context.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+            output = self.wo(context)
+            
+            return output
 
 # MoE Transformer Block with FlexAttention
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int,seq_len:int, head_dim: int, num_experts: int = 4, ffn_dim_mult: int = 4):
+    def __init__(self, dim: int, n_heads: int, seq_len: int, head_dim: int, num_experts: int = 4, ffn_dim_mult: int = 4, use_triton: bool = False):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
+        self.norm1 = RMSNorm(dim, use_triton=use_triton)
         
-        self.attn = MultiHeadAttention(dim, n_heads, head_dim, max_seq_len=seq_len)
+        self.attn = MultiHeadAttention(dim, n_heads, head_dim, max_seq_len=seq_len, use_triton=use_triton)
         
-        self.norm2 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim, use_triton=use_triton)
         
         hidden_dim = int(dim * ffn_dim_mult)
         
@@ -205,7 +225,8 @@ class SimpleModel(nn.Module):
                 n_heads=args.n_heads,
                 head_dim=head_dim,
                 num_experts=4,  # 4 experts in MoE
-                ffn_dim_mult=4
+                ffn_dim_mult=4,
+                use_triton=args.use_triton  # Pass the use_triton flag
             ) for i in range(args.n_layers)
         ])
         
@@ -255,6 +276,107 @@ def test_model_functionality(use_triton=True):
     # print(f"Device: {device}")
     return model
 
+def benchmark_model_speed(seq_len=4096, n_runs=10):
+    print("\n==== Benchmarking Model Speed: Triton vs Standard ====")
+    
+    # Create two sets of arguments - one with Triton, one without
+    triton_args = ModelArgs(
+        dim_embed=128,
+        n_layers=2,  # Using fewer layers for benchmarking
+        n_heads=4,
+        vocab_size=32000,
+        max_seq_len=seq_len,
+        use_triton=True
+    )
+    
+    standard_args = ModelArgs(
+        dim_embed=128,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=32000,
+        max_seq_len=seq_len,
+        use_triton=False
+    )
+    
+    # Check if CUDA is available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        print("Warning: CUDA not available, Triton will not be used regardless of setting.")
+    
+    # Create and initialize models
+    triton_model = SimpleModel(triton_args).to(device)
+    standard_model = SimpleModel(standard_args).to(device)
+    
+    # Set both models to evaluation mode
+    triton_model.eval()
+    standard_model.eval()
+    
+    # Generate random input tokens
+    batch_size = 1
+    tokens = torch.randint(0, triton_args.vocab_size, (batch_size, seq_len), device=device)
+    
+    # Lists to store timing results
+    triton_times = []
+    standard_times = []
+    
+    # Warm up
+    print("Warming up models...")
+    with torch.no_grad():
+        for _ in range(2):
+            triton_model(tokens)
+            standard_model(tokens)
+    
+    # Benchmark triton model
+    print("Benchmarking Triton model...")
+    with torch.no_grad():
+        for i in range(n_runs):
+            torch.cuda.synchronize()
+            start_time = time.time()
+            triton_model(tokens)
+            torch.cuda.synchronize()
+            end_time = time.time()
+            elapsed = end_time - start_time
+            triton_times.append(elapsed)
+            print(f"Run {i+1}/{n_runs}: {elapsed:.4f}s")
+    
+    # Benchmark standard model
+    print("Benchmarking Standard model...")
+    with torch.no_grad():
+        for i in range(n_runs):
+            torch.cuda.synchronize()
+            start_time = time.time()
+            standard_model(tokens)
+            torch.cuda.synchronize()
+            end_time = time.time()
+            elapsed = end_time - start_time
+            standard_times.append(elapsed)
+            print(f"Run {i+1}/{n_runs}: {elapsed:.4f}s")
+    
+    # Calculate and report results
+    min_triton = min(triton_times)
+    min_standard = min(standard_times)
+    avg_triton = sum(triton_times) / len(triton_times)
+    avg_standard = sum(standard_times) / len(standard_times)
+    
+    speedup = min_standard / min_triton if min_triton > 0 else float('inf')
+    
+    print("\n==== Results ====")
+    print(f"Sequence Length: {seq_len}")
+    print(f"Triton Model - Min: {min_triton:.4f}s, Avg: {avg_triton:.4f}s")
+    print(f"Standard Model - Min: {min_standard:.4f}s, Avg: {avg_standard:.4f}s")
+    print(f"Speedup (min time): {speedup:.2f}x")
+    
+    return {
+        "triton_min": min_triton,
+        "standard_min": min_standard,
+        "triton_avg": avg_triton,
+        "standard_avg": avg_standard,
+        "speedup": speedup
+    }
 
 if __name__ == "__main__":
+    # Test model functionality
     test_model = test_model_functionality(use_triton=True)
+    
+    # Run benchmarks
+    benchmark_results = benchmark_model_speed(seq_len=4096, n_runs=10)
